@@ -38,3 +38,6 @@ vendor/
 
 # Loadable providers
 templates/provider/kcm/files/
+
+# Generated documentation
+public/

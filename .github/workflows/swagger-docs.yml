@@ -1,0 +1,207 @@
+name: Generate Swagger Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'api/**'
+      - 'templates/provider/kcm/templates/crds/**'
+      - '.github/workflows/swagger-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  generate-swagger-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Set up Kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: swagger-gen
+          wait: 30s
+
+      - name: Install CRDs to cluster
+        run: |
+          kubectl apply -f templates/provider/kcm/templates/crds/
+
+      - name: Wait for CRDs to be established
+        run: |
+          set -euo pipefail
+          echo "Waiting for k0rdent CRDs to be established..."
+          crds=$(kubectl get crd -o name | grep k0rdent.mirantis.com || true)
+          if [ -z "$crds" ]; then
+            echo "No k0rdent.mirantis.com CRDs found after apply."
+            exit 1
+          fi
+          echo "$crds"
+          echo "$crds" | xargs -r -n1 -I{} kubectl wait --for=condition=Established --timeout=180s {}
+          echo "CRDs established."
+
+      - name: Extract OpenAPI specs from API server
+        run: |
+          set -euo pipefail
+          mkdir -p public/swagger
+          
+          wait_for_spec () {
+            local version=$1
+            local outfile="public/swagger/k0rdent-${version}-openapi.json"
+            local attempts=30
+            local sleep_seconds=10
+
+            for attempt in $(seq 1 "${attempts}"); do
+              echo "Fetching OpenAPI spec for ${version} (attempt ${attempt}/${attempts})..."
+              if kubectl get --raw "/openapi/v3/apis/k0rdent.mirantis.com/${version}" > "${outfile}"; then
+                echo "OpenAPI spec for ${version} fetched successfully."
+                return 0
+              fi
+              echo "Spec for ${version} not ready yet. Sleeping ${sleep_seconds}s..."
+              sleep "${sleep_seconds}"
+            done
+
+            echo "ERROR: Timed out waiting for OpenAPI spec for ${version}" >&2
+            return 1
+          }
+
+          wait_for_spec v1beta1
+          
+          # Verify the files
+          ls -lh public/swagger/
+          jq '.info.title' public/swagger/k0rdent-v1beta1-openapi.json
+
+      - name: Create Swagger UI HTML
+        run: |
+          cat > public/swagger/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <title>K0rdent API - Swagger UI</title>
+              <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+              <style>
+                body { margin: 0; padding: 0; }
+              </style>
+          </head>
+          <body>
+              <div id="swagger-ui"></div>
+              <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+              <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+              <script>
+                  window.onload = () => {
+                      window.ui = SwaggerUIBundle({
+                          urls: [
+                              { url: "k0rdent-v1beta1-openapi.json", name: "k0rdent.mirantis.com/v1beta1" }
+                          ],
+                          dom_id: '#swagger-ui',
+                          deepLinking: true,
+                          presets: [
+                              SwaggerUIBundle.presets.apis,
+                              SwaggerUIStandalonePreset
+                          ],
+                          plugins: [
+                              SwaggerUIBundle.plugins.DownloadUrl
+                          ],
+                          layout: "StandaloneLayout"
+                      });
+                  };
+              </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Create index page
+        run: |
+          cat > public/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>K0rdent API Documentation</title>
+              <style>
+                  body {
+                      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      padding: 2rem;
+                      line-height: 1.6;
+                  }
+                  h1 { color: #2c3e50; }
+                  .card {
+                      background: #f8f9fa;
+                      border-radius: 8px;
+                      padding: 1.5rem;
+                      margin: 1rem 0;
+                      border-left: 4px solid #007bff;
+                  }
+                  .card h2 { margin-top: 0; color: #007bff; }
+                  a { color: #007bff; text-decoration: none; }
+                  a:hover { text-decoration: underline; }
+                  .button {
+                      display: inline-block;
+                      background: #007bff;
+                      color: white;
+                      padding: 0.75rem 1.5rem;
+                      border-radius: 4px;
+                      margin: 0.5rem 0.5rem 0.5rem 0;
+                      font-weight: 500;
+                  }
+                  .button:hover {
+                      background: #0056b3;
+                      text-decoration: none;
+                  }
+              </style>
+          </head>
+          <body>
+              <h1>K0rdent API Documentation</h1>
+              <div class="card">
+                  <h2>Interactive Swagger UI</h2>
+                  <p>Explore the K0rdent API with Swagger UI.</p>
+                  <a href="swagger/" class="button">View Swagger UI →</a>
+              </div>
+              
+              <div class="card">
+                  <h2>Download OpenAPI Specs</h2>
+                  <p>Download the raw OpenAPI 3.0 specifications for use with your own tools.</p>
+                  <a href="swagger/k0rdent-v1beta1-openapi.json" class="button">Download v1beta1 Spec</a>
+              </div>
+              
+              <hr style="margin: 2rem 0; border: none; border-top: 1px solid #dee2e6;">
+              
+              <p>
+                  <strong>Links:</strong> 
+                  <a href="https://github.com/k0rdent/kcm">GitHub Repository</a> | 
+                  <a href="https://docs.k0rdent.io">Main Documentation</a>
+              </p>
+          </body>
+          </html>
+          EOF
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
